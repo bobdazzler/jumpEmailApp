@@ -1,19 +1,29 @@
 package jump.email.app.entity;
 
-import jakarta.persistence.Entity;
-import jakarta.persistence.GeneratedValue;
-import jakarta.persistence.Id;
+import jakarta.persistence.*;
 import lombok.Data;
 
 @Entity
+@Table(name = "email_items")
 @Data
 public class EmailItem {
     @Id
-    @GeneratedValue
-    private Long id;
+    @GeneratedValue(strategy = GenerationType.UUID)
+    private String id;
+    
     private String gmailId;
+    
+    @Column(columnDefinition = "TEXT")
     private String summary;
+    
+    @Column(columnDefinition = "TEXT")
     private String originalContent;
-    private Long categoryId;
-    private String userId;
+    
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "category_id")
+    private EmailCategory category;
+    
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "gmail_account_id")
+    private GmailAccount gmailAccount;
 }
