@@ -11,7 +11,6 @@ import org.springframework.stereotype.Service;
 
 import java.util.List;
 
-@Service
 @Slf4j
 public class AIService implements EmailClassificationService {
     private final OpenAiService openAiService;
