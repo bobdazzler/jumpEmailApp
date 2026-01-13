@@ -26,4 +26,9 @@ public class EmailItem {
     @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "gmail_account_id")
     private GmailAccount gmailAccount;
+    
+    // Unsubscribe tracking
+    private Boolean unsubscribed = false;
+    private String unsubscribeLink;
+    private String unsubscribeStatus; // "PENDING", "SUCCESS", "FAILED", "NOT_FOUND"
 }

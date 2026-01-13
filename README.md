@@ -148,7 +148,7 @@ fly secrets set OPENAI_API_KEY=your_openai_key
 mvn clean package
 fly deploy
 ```
-
+https://jump-email-sorter.fly.dev/login/oauth2/code/google
 ## Usage
 
 1. **Sign In**: Click "Sign in with Google" and authorize the application

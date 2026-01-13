@@ -81,6 +81,7 @@ public class AIService implements EmailClassificationService {
         }
     }
 
+
     public String summarizeEmail(String emailContent) {
         try {
             String prompt = String.format(

@@ -26,7 +26,7 @@ public class GeminiAIService implements EmailClassificationService {
     private final RestTemplate restTemplate;
     private final ObjectMapper objectMapper;
     private final String apiKey;
-    private static final String GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent";
+    private static final String GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent";
 
     public GeminiAIService(@Value("${gemini.api.key:}") String apiKey) {
         this.restTemplate = new RestTemplate();
