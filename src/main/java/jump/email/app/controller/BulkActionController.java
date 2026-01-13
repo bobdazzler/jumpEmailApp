@@ -163,7 +163,6 @@ public class BulkActionController {
     }
 
     @PostMapping("/bulk/unsubscribe")
-    @Transactional
     public String unsubscribeEmails(@RequestParam("emailIds") String emailIdsStr, Authentication authentication) {
         User user = oauthTokenService.getOrCreateUser(authentication);
         

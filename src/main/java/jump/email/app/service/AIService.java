@@ -91,7 +91,7 @@ public class AIService implements EmailClassificationService {
             
             ChatMessage message = new ChatMessage("user", prompt);
             ChatCompletionRequest request = ChatCompletionRequest.builder()
-                .model("gpt-3.5-turbo")
+                .model("gpt-5.1")
                 .messages(List.of(message))
                 .maxTokens(150)
                 .temperature(0.5)
@@ -104,14 +104,34 @@ public class AIService implements EmailClassificationService {
             return null; // Never reached, but needed for compilation
         }
     }
+    private static String trimEmail(String email) {
+        int max = 6000;
+        if (email.length() <= max) return email;
 
+        // keep footer where unsubscribe usually lives
+        return email.substring(email.length() - max);
+    }
     public String extractUnsubscribeLink(String emailContent) {
         try {
             // Use AI to find unsubscribe link in email HTML/text
             String prompt = String.format(
-                "Extract the unsubscribe URL from this email. Look for links that contain 'unsubscribe', 'opt-out', or similar terms. " +
-                "Return ONLY the URL, nothing else. If no unsubscribe link is found, return 'NOT_FOUND'.\n\nEmail:\n%s",
-                emailContent.length() > 2000 ? emailContent.substring(0, 2000) + "..." : emailContent
+                    """
+                    You are given the raw HTML of an email.
+                
+                    Task:
+                    - Find the unsubscribe link.
+                    - The unsubscribe link is usually an <a> tag with visible text like "Unsubscribe", "Manage preferences", or "Opt out".
+                    - The URL may be a tracking redirect and may not contain the word "unsubscribe".
+                
+                    Return ONLY the unsubscribe URL.
+                    If none exists, return EXACTLY: NOT_FOUND.
+                
+                    Email HTML:
+                    <<<
+                    %s
+                    >>>
+                    """,
+                    trimEmail(emailContent)
             );
             
             ChatMessage message = new ChatMessage("user", prompt);

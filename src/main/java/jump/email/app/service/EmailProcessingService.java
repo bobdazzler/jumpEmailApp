@@ -10,11 +10,14 @@ import jump.email.app.repository.EmailItemRepository;
 import jump.email.app.repository.GmailAccountRepository;
 import jump.email.app.repository.UserRepository;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.scheduling.annotation.Async;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 
 @Slf4j
 @Service
@@ -26,6 +29,12 @@ public class EmailProcessingService {
     private final UserRepository userRepository;
     private final GmailAccountRepository gmailAccountRepository;
     private final TokenRefreshService tokenRefreshService;
+    private final DistributedLockService distributedLockService;
+    
+    // Rate limiting: Gmail API allows 250 quota units per user per second
+    // Each API call costs ~5-10 units, so we limit to ~20-30 calls per second per account
+    private static final long RATE_LIMIT_DELAY_MS = 50; // ~20 calls per second
+    private static final int BATCH_SIZE = 10; // Process emails in batches of 10
 
     public EmailProcessingService(
             GmailApiService gmailApiService,
@@ -34,7 +43,8 @@ public class EmailProcessingService {
             CategoryRepository categoryRepository,
             UserRepository userRepository,
             GmailAccountRepository gmailAccountRepository,
-            TokenRefreshService tokenRefreshService) {
+            TokenRefreshService tokenRefreshService,
+            DistributedLockService distributedLockService) {
         this.gmailApiService = gmailApiService;
         this.emailClassificationService = emailClassificationService;
         this.emailItemRepository = emailItemRepository;
@@ -42,181 +52,242 @@ public class EmailProcessingService {
         this.userRepository = userRepository;
         this.gmailAccountRepository = gmailAccountRepository;
         this.tokenRefreshService = tokenRefreshService;
+        this.distributedLockService = distributedLockService;
     }
 
     /**
      * Scheduled task runs less frequently now (every 5 minutes) since we use History API
      * for efficient incremental fetching. This serves as a backup to catch any missed emails.
+     * 
+     * Now with:
+     * - Async processing per account
+     * - Distributed locking for multi-node safety
+     * - Rate limiting
+     * - Batch processing
      */
     @Scheduled(fixedRate = 300000) // Run every 5 minutes (backup/fallback)
-    @Transactional
     public void processNewEmails() {
-        log.info("processing new email started");
+        log.info("Processing new emails started");
         try {
             List<User> users = userRepository.findAll();
+            List<CompletableFuture<Void>> futures = new ArrayList<>();
             
             for (User user : users) {
                 List<GmailAccount> accounts = gmailAccountRepository.findByUser(user);
+                String primaryEmail = user.getPrimaryEmail();
+                log.info("Fetching emails for user {}", primaryEmail);
                 
                 for (GmailAccount account : accounts) {
-                    if (account.getToken() == null || account.getToken().getAccessToken() == null) {
-                        continue;
-                    }
-                    
-                    if (account.getSyncStatus() != jump.email.app.entity.SyncStatus.ACTIVE) {
-                        continue;
-                    }
-                    
-                    String emailAddress = account.getEmailAddress();
-                    
-                    try {
-                        // Ensure access token is valid (refresh if needed)
-                        String accessToken = tokenRefreshService.ensureValidAccessToken(account);
-                        
-                        try {
-                            // Use History API with stored historyId for efficient incremental fetching
-                            List<Message> newEmails = gmailApiService.fetchNewEmails(accessToken, emailAddress, account.getLastHistoryId());
-                            
-                            for (Message email : newEmails) {
-                                processEmail(email, account, accessToken, emailAddress);
-                            }
-                            
-                            // Update historyId after processing
-                            if (!newEmails.isEmpty()) {
-                                try {
-                                    String newHistoryId = gmailApiService.getCurrentHistoryId(accessToken, emailAddress);
-                                    if (newHistoryId != null) {
-                                        account.setLastHistoryId(newHistoryId);
-                                        gmailAccountRepository.save(account);
-                                    }
-                                } catch (Exception e) {
-                                    log.error("Failed to update historyId for account {}: {}", emailAddress, e.getMessage(), e);
-                                }
-                            }
-                        } catch (com.google.api.client.googleapis.json.GoogleJsonResponseException e) {
-                            // Handle 401 Unauthorized - refresh token and retry once
-                            if (e.getStatusCode() == 401) {
-                                log.info("Received 401 for account {}, refreshing token and retrying...", emailAddress);
-                                try {
-                                    // Reload account to get latest state
-                                    account = gmailAccountRepository.findById(account.getId())
-                                        .orElseThrow(() -> new RuntimeException("Account not found"));
-                                    accessToken = tokenRefreshService.refreshTokenOn401(account);
-                                    // Reload again after refresh
-                                    account = gmailAccountRepository.findById(account.getId())
-                                        .orElseThrow(() -> new RuntimeException("Account not found"));
-                                    
-                                    // Retry the operation
-                                    List<Message> newEmails = gmailApiService.fetchNewEmails(accessToken, emailAddress, account.getLastHistoryId());
-                                    
-                                    for (Message email : newEmails) {
-                                        processEmail(email, account, accessToken, emailAddress);
-                                    }
-                                    
-                                    // Update historyId after processing
-                                    if (!newEmails.isEmpty()) {
-                                        try {
-                                            String newHistoryId = gmailApiService.getCurrentHistoryId(accessToken, emailAddress);
-                                            if (newHistoryId != null) {
-                                                account.setLastHistoryId(newHistoryId);
-                                                gmailAccountRepository.save(account);
-                                            }
-                                        } catch (Exception e2) {
-                                            log.error("Failed to update historyId after retry for account {}: {}", emailAddress, e2.getMessage(), e2);
-                                        }
-                                    }
-                                } catch (Exception retryException) {
-                                    log.error("Failed to refresh token and retry for account {}: {}", emailAddress, retryException.getMessage(), retryException);
-                                    throw retryException;
-                                }
-                            } else {
-                                throw e;
-                            }
-                        }
-                    } catch (Exception e) {
-                        log.error("Error processing emails for account {}: {}", account.getEmailAddress(), e.getMessage(), e);
-                    }
+                    // Process each account asynchronously
+                    CompletableFuture<Void> future = processAccountEmailsAsync(account);
+                    futures.add(future);
                 }
             }
+            
+            // Wait for all async tasks to complete (with timeout)
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+                .exceptionally(ex -> {
+                    log.error("Error in async email processing: {}", ex.getMessage(), ex);
+                    return null;
+                })
+                .join();
+                
         } catch (Exception e) {
             log.error("Error in scheduled email processing: {}", e.getMessage(), e);
         }
-        log.info("processing new email ended");
+        log.info("Processing new emails ended");
+    }
+    
+    /**
+     * Process emails for a single account asynchronously.
+     * Uses distributed locking to ensure only one node processes an account at a time.
+     */
+    @Async("emailProcessingExecutor")
+    public CompletableFuture<Void> processAccountEmailsAsync(GmailAccount account) {
+        String accountId = account.getId();
+        String nodeId = distributedLockService.getNodeId();
+        
+        // Try to acquire distributed lock
+        if (!distributedLockService.tryLock(accountId, nodeId)) {
+            log.debug("Account {} is already being processed by another node, skipping", account.getEmailAddress());
+            return CompletableFuture.completedFuture(null);
+        }
+        
+        try {
+            processAccountEmails(account);
+        } finally {
+            // Always release the lock
+            distributedLockService.releaseLock(accountId, nodeId);
+        }
+        
+        return CompletableFuture.completedFuture(null);
+    }
+    
+    /**
+     * Process emails for a single account with rate limiting and batching.
+     */
+    private void processAccountEmails(GmailAccount account) {
+        if (account.getToken() == null || account.getToken().getAccessToken() == null) {
+            log.debug("Account {} has no valid token, skipping", account.getEmailAddress());
+            return;
+        }
+        
+        if (account.getSyncStatus() != jump.email.app.entity.SyncStatus.ACTIVE) {
+            log.debug("Account {} is not active, skipping", account.getEmailAddress());
+            return;
+        }
+        
+        String emailAddress = account.getEmailAddress();
+        
+        try {
+            // Ensure access token is valid (refresh if needed)
+            String accessToken = tokenRefreshService.ensureValidAccessToken(account);
+            
+            // Rate limit: delay before API call
+            Thread.sleep(RATE_LIMIT_DELAY_MS);
+            
+            try {
+                // Use History API with stored historyId for efficient incremental fetching
+                List<Message> newEmails = gmailApiService.fetchNewEmails(accessToken, emailAddress, account.getLastHistoryId());
+                log.info("Emails to process count {} for {}", newEmails.size(), emailAddress);
+                
+                if (newEmails.isEmpty()) {
+                    return;
+                }
+                
+                // Process emails in batches with rate limiting
+                processEmailsInBatches(newEmails, account, accessToken, emailAddress);
+                
+                // Update historyId after processing
+                try {
+                    Thread.sleep(RATE_LIMIT_DELAY_MS); // Rate limit before historyId call
+                    String newHistoryId = gmailApiService.getCurrentHistoryId(accessToken, emailAddress);
+                    if (newHistoryId != null) {
+                        account.setLastHistoryId(newHistoryId);
+                        gmailAccountRepository.save(account);
+                    }
+                } catch (Exception e) {
+                    log.error("Failed to update historyId for account {}: {}", emailAddress, e.getMessage(), e);
+                }
+                
+            } catch (com.google.api.client.googleapis.json.GoogleJsonResponseException e) {
+                // Handle 401 Unauthorized - refresh token and retry once
+                if (e.getStatusCode() == 401) {
+                    log.info("Received 401 for account {}, refreshing token and retrying...", emailAddress);
+                    handle401Error(account, emailAddress);
+                } else {
+                    log.error("Gmail API error for account {}: {} - {}", emailAddress, e.getStatusCode(), e.getMessage());
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.warn("Email processing interrupted for account {}", emailAddress);
+        } catch (Exception e) {
+            log.error("Error processing emails for account {}: {}", account.getEmailAddress(), e.getMessage(), e);
+        }
+    }
+    
+    /**
+     * Process emails in batches with rate limiting.
+     */
+    private void processEmailsInBatches(List<Message> emails, GmailAccount account, String accessToken, String emailAddress) {
+        for (int i = 0; i < emails.size(); i += BATCH_SIZE) {
+            int endIndex = Math.min(i + BATCH_SIZE, emails.size());
+            List<Message> batch = emails.subList(i, endIndex);
+            
+            log.debug("Processing batch {}-{} of {} emails for account {}", 
+                    i + 1, endIndex, emails.size(), emailAddress);
+            
+            for (Message email : batch) {
+                try {
+                    // Rate limit: delay between email processing
+                    Thread.sleep(RATE_LIMIT_DELAY_MS);
+                    
+                    processSingleEmail(email, account, accessToken, emailAddress);
+                } catch (Exception e) {
+                    log.error("Failed to process email {} for account {}: {}", 
+                            email.getId(), emailAddress, e.getMessage(), e);
+                    // Continue with next email - no rollback
+                }
+            }
+            
+            // Small delay between batches
+            try {
+                Thread.sleep(RATE_LIMIT_DELAY_MS * 2);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                log.warn("Batch processing interrupted");
+                break;
+            }
+        }
+    }
+    
+    /**
+     * Handle 401 Unauthorized error by refreshing token and retrying.
+     */
+    private void handle401Error(GmailAccount account, String emailAddress) {
+        try {
+            // Reload account to get latest state
+            account = gmailAccountRepository.findById(account.getId())
+                .orElseThrow(() -> new RuntimeException("Account not found"));
+            String accessToken = tokenRefreshService.refreshTokenOn401(account);
+            
+            // Reload again after refresh
+            account = gmailAccountRepository.findById(account.getId())
+                .orElseThrow(() -> new RuntimeException("Account not found"));
+            
+            // Rate limit before retry
+            Thread.sleep(RATE_LIMIT_DELAY_MS);
+            
+            // Retry the operation
+            List<Message> newEmails = gmailApiService.fetchNewEmails(accessToken, emailAddress, account.getLastHistoryId());
+            
+            // Process emails in batches
+            processEmailsInBatches(newEmails, account, accessToken, emailAddress);
+            
+            // Update historyId after processing
+            if (!newEmails.isEmpty()) {
+                try {
+                    Thread.sleep(RATE_LIMIT_DELAY_MS);
+                    String newHistoryId = gmailApiService.getCurrentHistoryId(accessToken, emailAddress);
+                    if (newHistoryId != null) {
+                        account.setLastHistoryId(newHistoryId);
+                        gmailAccountRepository.save(account);
+                    }
+                } catch (Exception e2) {
+                    log.error("Failed to update historyId after retry for account {}: {}", emailAddress, e2.getMessage(), e2);
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.warn("Token refresh retry interrupted for account {}", emailAddress);
+        } catch (Exception retryException) {
+            log.error("Failed to refresh token and retry for account {}: {}", emailAddress, retryException.getMessage(), retryException);
+        }
     }
 
     /**
      * Manually trigger email processing for a user (can be called from webhook/API).
      * This method uses History API for efficient fetching.
+     * Uses async processing with distributed locking for multi-node safety.
      */
-    @Transactional
     public void processEmailsForUserImmediate(User user) {
         List<GmailAccount> accounts = gmailAccountRepository.findByUser(user);
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
         
         for (GmailAccount account : accounts) {
-            if (account.getToken() == null || account.getToken().getAccessToken() == null) {
-                continue;
-            }
-            
-            if (account.getSyncStatus() != jump.email.app.entity.SyncStatus.ACTIVE) {
-                continue;
-            }
-            
-            String emailAddress = account.getEmailAddress();
-            
-            try {
-                // Ensure access token is valid (refresh if needed)
-                String accessToken = tokenRefreshService.ensureValidAccessToken(account);
-                
-                try {
-                    List<Message> newEmails = gmailApiService.fetchNewEmails(accessToken, emailAddress, account.getLastHistoryId());
-                    
-                    for (Message email : newEmails) {
-                        processEmail(email, account, accessToken, emailAddress);
-                    }
-                    
-                    // Update historyId
-                    if (!newEmails.isEmpty()) {
-                        String newHistoryId = gmailApiService.getCurrentHistoryId(accessToken, emailAddress);
-                        if (newHistoryId != null) {
-                            account.setLastHistoryId(newHistoryId);
-                            gmailAccountRepository.save(account);
-                        }
-                    }
-                } catch (com.google.api.client.googleapis.json.GoogleJsonResponseException e) {
-                    // Handle 401 Unauthorized - refresh token and retry once
-                    if (e.getStatusCode() == 401) {
-                        log.info("Received 401 for account {}, refreshing token and retrying...", emailAddress);
-                        // Reload account to get latest state
-                        account = gmailAccountRepository.findById(account.getId())
-                            .orElseThrow(() -> new RuntimeException("Account not found"));
-                        accessToken = tokenRefreshService.refreshTokenOn401(account);
-                        // Reload again after refresh
-                        account = gmailAccountRepository.findById(account.getId())
-                            .orElseThrow(() -> new RuntimeException("Account not found"));
-                        
-                        // Retry the operation
-                        List<Message> newEmails = gmailApiService.fetchNewEmails(accessToken, emailAddress, account.getLastHistoryId());
-                        
-                        for (Message email : newEmails) {
-                            processEmail(email, account, accessToken, emailAddress);
-                        }
-                        
-                        // Update historyId
-                        if (!newEmails.isEmpty()) {
-                            String newHistoryId = gmailApiService.getCurrentHistoryId(accessToken, emailAddress);
-                            if (newHistoryId != null) {
-                                account.setLastHistoryId(newHistoryId);
-                                gmailAccountRepository.save(account);
-                            }
-                        }
-                    } else {
-                        throw e;
-                    }
-                }
-            } catch (Exception e) {
-                throw new RuntimeException("Error processing emails for account " + account.getEmailAddress() + ": " + e.getMessage(), e);
-            }
+            // Process each account asynchronously
+            CompletableFuture<Void> future = processAccountEmailsAsync(account);
+            futures.add(future);
         }
+        
+        // Wait for all async tasks to complete
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+            .exceptionally(ex -> {
+                log.error("Error in async email processing for user {}: {}", user.getId(), ex.getMessage(), ex);
+                return null;
+            })
+            .join();
     }
 
     /**
@@ -239,7 +310,12 @@ public class EmailProcessingService {
             });
     }
 
-    private void processEmail(Message email, GmailAccount account, String accessToken, String gmailUserId) {
+    /**
+     * Process a single email in its own transaction.
+     * If this method fails, it will be logged but won't affect other emails in the batch.
+     */
+    @Transactional
+    public void processSingleEmail(Message email, GmailAccount account, String accessToken, String gmailUserId) {
         try {
             String messageId = email.getId();
             

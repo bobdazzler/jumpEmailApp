@@ -34,8 +34,17 @@
             </div>
             <div class="mb-3">
                 <strong>Original Content:</strong>
-                <div class="mt-2 p-3 bg-light border rounded" style="max-height: 600px; overflow-y: auto; white-space: pre-wrap; font-family: monospace; font-size: 0.9em;" 
-                     th:text="${fullContent}"></div>
+                <div class="mt-2 p-3 bg-white border rounded" style="max-height: 600px; overflow-y: auto;">
+                    <!-- Check if content contains HTML tags -->
+                    <div th:if="${fullContent != null and (#strings.contains(fullContent, '<') and (#strings.contains(fullContent, '<div') or #strings.contains(fullContent, '<p>') or #strings.contains(fullContent, '<br') or #strings.contains(fullContent, '<table') or #strings.contains(fullContent, '<img') or #strings.contains(fullContent, '<a ') or #strings.contains(fullContent, '<span') or #strings.contains(fullContent, '<body') or #strings.contains(fullContent, '<html')))}">
+                        <!-- Render as HTML (unescaped) -->
+                        <div th:utext="${fullContent}"></div>
+                    </div>
+                    <!-- Fallback to plain text if no HTML detected -->
+                    <div th:unless="${fullContent != null and (#strings.contains(fullContent, '<') and (#strings.contains(fullContent, '<div') or #strings.contains(fullContent, '<p>') or #strings.contains(fullContent, '<br') or #strings.contains(fullContent, '<table') or #strings.contains(fullContent, '<img') or #strings.contains(fullContent, '<a ') or #strings.contains(fullContent, '<span') or #strings.contains(fullContent, '<body') or #strings.contains(fullContent, '<html')))}" 
+                         style="white-space: pre-wrap; font-family: monospace; font-size: 0.9em;" 
+                         th:text="${fullContent}"></div>
+                </div>
             </div>
         </div>
     </div>

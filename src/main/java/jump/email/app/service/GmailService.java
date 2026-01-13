@@ -151,20 +151,45 @@ public class GmailService implements GmailApiService {
                 }
             }
             
-            content.append("Subject: ").append(subject).append("\n");
-            content.append("From: ").append(from).append("\n");
-            content.append("Date: ").append(date).append("\n\n");
+            // Extract body - prioritize HTML over plain text
+            BodyExtractionResult bodyResult = extractBodyFromParts(message.getPayload());
+            body = bodyResult.htmlContent != null && !bodyResult.htmlContent.isEmpty() 
+                ? bodyResult.htmlContent 
+                : (bodyResult.plainTextContent != null ? bodyResult.plainTextContent : "");
             
-            // Extract body
-            body = extractBodyFromParts(message.getPayload());
-            content.append(body);
+            // If we have HTML, include headers as HTML; otherwise as plain text
+            if (bodyResult.htmlContent != null && !bodyResult.htmlContent.isEmpty()) {
+                // Format headers as HTML
+                content.append("<div style='font-family: Arial, sans-serif; padding: 10px; border-bottom: 1px solid #ddd; margin-bottom: 10px;'>");
+                content.append("<strong>Subject:</strong> ").append(escapeHtml(subject)).append("<br>");
+                content.append("<strong>From:</strong> ").append(escapeHtml(from)).append("<br>");
+                content.append("<strong>Date:</strong> ").append(escapeHtml(date));
+                content.append("</div>");
+                content.append("<div style='font-family: Arial, sans-serif;'>");
+                content.append(body);
+                content.append("</div>");
+            } else {
+                // Plain text format
+                content.append("Subject: ").append(subject).append("\n");
+                content.append("From: ").append(from).append("\n");
+                content.append("Date: ").append(date).append("\n\n");
+                content.append(body);
+            }
         }
         
         return content.toString();
     }
 
-    private String extractBodyFromParts(MessagePart part) {
-        StringBuilder body = new StringBuilder();
+    /**
+     * Helper class to store both HTML and plain text content from email parts
+     */
+    private static class BodyExtractionResult {
+        String htmlContent = null;
+        String plainTextContent = null;
+    }
+    
+    private BodyExtractionResult extractBodyFromParts(MessagePart part) {
+        BodyExtractionResult result = new BodyExtractionResult();
         
         if (part.getBody() != null && part.getBody().getData() != null) {
             String data = part.getBody().getData();
@@ -175,7 +200,14 @@ public class GmailService implements GmailApiService {
                     // Gmail uses URL-safe Base64 encoding - decode directly without replacement
                     // Base64.getUrlDecoder() handles '-' and '_' characters correctly
                     byte[] decodedBytes = Base64.getUrlDecoder().decode(data);
-                    body.append(new String(decodedBytes, java.nio.charset.StandardCharsets.UTF_8));
+                    String decodedText = new String(decodedBytes, java.nio.charset.StandardCharsets.UTF_8);
+                    
+                    // Store HTML and plain text separately
+                    if (mimeType.equals("text/html")) {
+                        result.htmlContent = decodedText;
+                    } else if (mimeType.equals("text/plain")) {
+                        result.plainTextContent = decodedText;
+                    }
                 } catch (IllegalArgumentException e) {
                     // If URL-safe decoding fails (e.g., contains invalid characters), try padding and standard Base64
                     try {
@@ -187,7 +219,14 @@ public class GmailService implements GmailApiService {
                         }
                         // Try standard Base64 decoder
                         byte[] decodedBytes = Base64.getDecoder().decode(paddedData);
-                        body.append(new String(decodedBytes, java.nio.charset.StandardCharsets.UTF_8));
+                        String decodedText = new String(decodedBytes, java.nio.charset.StandardCharsets.UTF_8);
+                        
+                        // Store HTML and plain text separately
+                        if (mimeType.equals("text/html")) {
+                            result.htmlContent = decodedText;
+                        } else if (mimeType.equals("text/plain")) {
+                            result.plainTextContent = decodedText;
+                        }
                     } catch (Exception e2) {
                         // If both fail, log and skip this part
                         log.warn("Error decoding email body part (mimeType: {}): {}", mimeType, e2.getMessage());
@@ -199,13 +238,35 @@ public class GmailService implements GmailApiService {
             }
         }
         
+        // Recursively process sub-parts and merge results (HTML takes priority)
         if (part.getParts() != null) {
             for (MessagePart subPart : part.getParts()) {
-                body.append(extractBodyFromParts(subPart));
+                BodyExtractionResult subResult = extractBodyFromParts(subPart);
+                // Merge results - HTML takes priority, but accumulate plain text
+                if (subResult.htmlContent != null && !subResult.htmlContent.isEmpty()) {
+                    result.htmlContent = (result.htmlContent != null ? result.htmlContent + "\n" : "") + subResult.htmlContent;
+                }
+                if (subResult.plainTextContent != null && !subResult.plainTextContent.isEmpty()) {
+                    result.plainTextContent = (result.plainTextContent != null ? result.plainTextContent + "\n" : "") + subResult.plainTextContent;
+                }
             }
         }
         
-        return body.toString();
+        return result;
+    }
+    
+    /**
+     * Escape HTML special characters for safe display
+     */
+    private String escapeHtml(String text) {
+        if (text == null) {
+            return "";
+        }
+        return text.replace("&", "&amp;")
+                   .replace("<", "&lt;")
+                   .replace(">", "&gt;")
+                   .replace("\"", "&quot;")
+                   .replace("'", "&#39;");
     }
 
     public void archiveEmail(String accessToken, String userId, String messageId) throws Exception {
@@ -222,7 +283,7 @@ public class GmailService implements GmailApiService {
 
     public void deleteEmail(String accessToken, String userId, String messageId) throws Exception {
         Gmail service = getGmailService(accessToken);
-        service.users().messages().delete(userId, messageId).execute();
+        service.users().messages().trash(userId, messageId).execute();
     }
 
     public Message getEmail(String accessToken, String userId, String messageId) throws Exception {
